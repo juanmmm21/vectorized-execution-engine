@@ -17,7 +17,8 @@ from __future__ import annotations
 import argparse
 import random
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 
 from .batch import InMemoryTableSource, RowBatch
 from .models import (
@@ -39,10 +40,12 @@ from .models import (
     PhysicalProject,
     PhysicalSort,
     PhysicalTableScan,
+    Schema,
     SelectItem,
     Star,
     TableRef,
 )
+from .operators import FilterOperator, ScanOperator
 from .pipeline import execute_plan, explain
 
 
@@ -271,6 +274,42 @@ def _report(label: str, processed_rows: int, output_rows: int, elapsed: float) -
     )
 
 
+@dataclass(slots=True)
+class _ReplayOperator:
+    """`Operator` ad-hoc que sólo repite batches ya materializados.
+
+    Usado exclusivamente por el benchmark para medir el coste de
+    `FilterOperator` en aislado: si se cronometrase `ScanOperator` +
+    `FilterOperator` juntos, el resultado incluiría el coste (pagado una
+    única vez, no repetido por cada fila) de construir arrays de NumPy a
+    partir de los `list[dict]` internos de `InMemoryTableSource` — un coste
+    de "columnarización" que no existe en un motor de producción con
+    almacenamiento ya columnar, y que dominaría por completo una
+    comparación honesta contra un filtro fila a fila en Python puro sobre
+    los MISMOS valores ya extraídos.
+    """
+
+    schema: Schema
+    batches: list[RowBatch]
+
+    @property
+    def output_schema(self) -> Schema:
+        return self.schema
+
+    def execute(self) -> Iterator[RowBatch]:
+        yield from self.batches
+
+
+def _naive_filter(amounts: list[float], threshold: float) -> float:
+    """Filtra `amounts` fila a fila con un bucle Python explícito — la
+    comparación honesta que motiva este motor: cuánto se gana vectorizando
+    `amount > umbral` sobre NumPy frente a Python puro, sobre los mismos
+    valores ya extraídos (ver `_ReplayOperator`)."""
+    start = time.perf_counter()
+    _ = [amount for amount in amounts if amount > threshold]
+    return time.perf_counter() - start
+
+
 def run_benchmark(row_count: int, seed: int) -> None:
     source = _build_benchmark_source(row_count, seed)
     print(f"Benchmark: {row_count} filas en 'orders', semilla={seed}\n")
@@ -283,6 +322,31 @@ def run_benchmark(row_count: int, seed: int) -> None:
     )
     elapsed, rows = _time_plan(filtered, source)
     _report("Scan + Filter:", row_count, rows, elapsed)
+
+    scan_operator = ScanOperator(TableRef("orders", "o"), source)
+    prebuilt_batches = list(scan_operator.execute())
+    replay = _ReplayOperator(scan_operator.output_schema, prebuilt_batches)
+    filter_only = FilterOperator(
+        replay,
+        BinaryOp(ColumnRef("amount", "o"), BinaryOperator.GT, Literal(250.0, LiteralType.FLOAT)),
+    )
+    vectorized_start = time.perf_counter()
+    vectorized_rows = sum(batch.row_count for batch in filter_only.execute())
+    vectorized_elapsed = time.perf_counter() - vectorized_start
+
+    amounts = [
+        float(value)
+        for batch in prebuilt_batches
+        for i, value in enumerate(batch.columns["o.amount"])
+        if not batch.nulls["o.amount"][i]
+    ]
+    naive_elapsed = _naive_filter(amounts, 250.0)
+    speedup = naive_elapsed / vectorized_elapsed if vectorized_elapsed > 0 else float("inf")
+    print(
+        f"  (filtro aislado sobre batches ya materializados: vectorizado "
+        f"{vectorized_elapsed:.4f}s ({vectorized_rows} filas) vs. Python puro "
+        f"{naive_elapsed:.4f}s -> {speedup:.1f}x más rápido vectorizado)"
+    )
 
     equi_condition = BinaryOp(
         ColumnRef("id", "c"), BinaryOperator.EQ, ColumnRef("customer_id", "o")
