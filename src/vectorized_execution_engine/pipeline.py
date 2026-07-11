@@ -24,9 +24,11 @@ from collections.abc import Iterator
 
 from .aggregate import HashAggregateOperator
 from .batch import RowBatch, TableSource, concat_batches
+from .distinct import DistinctOperator
 from .errors import UnsupportedOperatorError
 from .joins import HashJoinOperator, NestedLoopJoinOperator
 from .models import (
+    PhysicalDistinct,
     PhysicalFilter,
     PhysicalHashAggregate,
     PhysicalHashJoin,
@@ -99,6 +101,11 @@ def build_operator_tree(
         return ProjectOperator(
             build_operator_tree(plan.input, source, memory_budget=budget), plan.items
         )
+    if isinstance(plan, PhysicalDistinct):
+        return DistinctOperator(
+            build_operator_tree(plan.input, source, memory_budget=budget),
+            memory_budget=budget,
+        )
     if isinstance(plan, PhysicalSort):
         return SortOperator(
             build_operator_tree(plan.input, source, memory_budget=budget),
@@ -140,7 +147,12 @@ def collect(
 def _children(plan: PhysicalOperator) -> tuple[PhysicalOperator, ...]:
     if isinstance(
         plan,
-        PhysicalFilter | PhysicalHashAggregate | PhysicalProject | PhysicalSort | PhysicalLimit,
+        PhysicalFilter
+        | PhysicalHashAggregate
+        | PhysicalProject
+        | PhysicalSort
+        | PhysicalLimit
+        | PhysicalDistinct,
     ):
         return (plan.input,)
     if isinstance(plan, PhysicalNestedLoopJoin | PhysicalHashJoin):

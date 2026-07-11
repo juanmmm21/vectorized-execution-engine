@@ -273,6 +273,13 @@ class PhysicalProject(PhysicalOperator):
 
 
 @dataclass(frozen=True, slots=True)
+class PhysicalDistinct(PhysicalOperator):
+    input: PhysicalOperator
+    estimated_rows: float
+    estimated_cost: float
+
+
+@dataclass(frozen=True, slots=True)
 class PhysicalSort(PhysicalOperator):
     input: PhysicalOperator
     order_by: tuple[OrderByItem, ...]
