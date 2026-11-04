@@ -104,8 +104,21 @@ class HashAggregateOperator:
     aggregates: tuple[FunctionCall, ...]
     memory_budget: MemoryBudget = field(default_factory=MemoryBudget)
 
+    def _effective_group_by(self, input_schema: Schema) -> tuple[Expression, ...]:
+        """Claves de grupo sin repeticiones. Dos claves con el mismo nombre de
+        salida son la misma clave: `GROUP BY col1, t.col1` resuelve ambas
+        referencias a la misma columna de entrada, y agrupar dos veces por
+        ella equivale a agrupar una. Se conserva la primera aparición."""
+        seen: dict[str, Expression] = {}
+        for expr in self.group_by:
+            seen.setdefault(_group_output_name(expr, input_schema), expr)
+        return tuple(seen.values())
+
     def _group_names(self, input_schema: Schema) -> tuple[str, ...]:
-        return tuple(_group_output_name(expr, input_schema) for expr in self.group_by)
+        return tuple(
+            _group_output_name(expr, input_schema)
+            for expr in self._effective_group_by(input_schema)
+        )
 
     def _aggregate_names(self) -> tuple[str, ...]:
         return tuple(expression_key(func) for func in self.aggregates)
@@ -119,7 +132,7 @@ class HashAggregateOperator:
         if len(set(columns)) != len(columns):
             raise SchemaConflictError(next(name for name in columns if columns.count(name) > 1))
         types: dict[str, ColumnType] = {}
-        for expr, name in zip(self.group_by, group_names, strict=True):
+        for expr, name in zip(self._effective_group_by(input_schema), group_names, strict=True):
             types[name] = infer_expression_type(expr, input_schema)
         for func, name in zip(self.aggregates, aggregate_names, strict=True):
             types[name] = _aggregate_output_type(func, input_schema)
@@ -130,7 +143,8 @@ class HashAggregateOperator:
         materialized = concat_batches(input_schema, list(self.input.execute()))
         self.memory_budget.reserve("HashAggregateOperator", estimate_batch_bytes(materialized))
 
-        group_arrays = [evaluate(expr, materialized) for expr in self.group_by]
+        group_by = self._effective_group_by(input_schema)
+        group_arrays = [evaluate(expr, materialized) for expr in group_by]
         aggregate_args = [
             None if func.star_argument else evaluate(func.arguments[0], materialized)
             for func in self.aggregates

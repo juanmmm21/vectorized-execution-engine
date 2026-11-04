@@ -143,3 +143,19 @@ def test_min_and_max() -> None:
     rows = _rows(agg)
     assert rows[0]["MIN(o.amount)"] == 5.0
     assert rows[0]["MAX(o.amount)"] == 30.0
+
+
+def test_equivalent_group_keys_are_one_key() -> None:
+    """`GROUP BY customer_id, o.customer_id` nombra dos veces la misma
+    columna de entrada: agrupa igual que una sola clave (antes fallaba con
+    SchemaConflictError por la columna de salida duplicada)."""
+    source = _orders_source()
+    scan = ScanOperator(TableRef("orders", "o"), source)
+    agg = HashAggregateOperator(
+        scan,
+        group_by=(ColumnRef("customer_id"), ColumnRef("customer_id", "o")),
+        aggregates=(FunctionCall("COUNT", star_argument=True),),
+    )
+    assert agg.output_schema.columns == ("o.customer_id", "COUNT(*)")
+    counts = {row["o.customer_id"]: row["COUNT(*)"] for row in _rows(agg)}
+    assert counts == {1: 2, 2: 2, None: 2}

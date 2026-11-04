@@ -20,6 +20,11 @@ from .expressions import evaluate, resolve_column, to_native
 from .models import BinaryOp, BinaryOperator, ColumnRef, Expression, JoinType, Schema
 from .protocols import MemoryBudget, Operator, estimate_batch_bytes
 
+#: Tope de pares (fila_left, fila_right) que el nested-loop join materializa
+#: a la vez: acota su memoria de trabajo a O(MAX_PAIRS_PER_STEP) filas
+#: combinadas, independientemente del tamaño de las entradas.
+MAX_PAIRS_PER_STEP = 1 << 16
+
 
 @dataclass(slots=True)
 class NestedLoopJoinOperator:
@@ -66,21 +71,28 @@ class NestedLoopJoinOperator:
                 r_count = right_batch.row_count
                 if l_count == 0 or r_count == 0:
                     continue
-                left_idx = np.repeat(np.arange(l_count), r_count)
-                right_idx = np.tile(np.arange(r_count), l_count)
-                combined = hstack_batches(
-                    left_batch.take(left_idx), right_batch.take(right_idx), out_schema
-                )
-                if self.condition is not None:
-                    values, nulls = evaluate(self.condition, combined)
-                    match_mask = values & ~nulls
-                else:
-                    match_mask = np.ones(combined.row_count, dtype=np.bool_)
-                if not np.any(match_mask):
-                    continue
-                left_matched[left_idx[match_mask]] = True
-                right_matched[right_pos][right_idx[match_mask]] = True
-                yield combined.take(np.nonzero(match_mask)[0])
+                # Los pares se generan por tramos de filas de `left` para que
+                # el batch combinado nunca supere MAX_PAIRS_PER_STEP filas:
+                # antes un left de 10^5 filas contra un right de 10^3 creaba
+                # 10^8 pares de golpe (decenas de GB) antes de filtrar nada.
+                step = max(1, MAX_PAIRS_PER_STEP // r_count)
+                for start in range(0, l_count, step):
+                    stop = min(l_count, start + step)
+                    left_idx = np.repeat(np.arange(start, stop), r_count)
+                    right_idx = np.tile(np.arange(r_count), stop - start)
+                    combined = hstack_batches(
+                        left_batch.take(left_idx), right_batch.take(right_idx), out_schema
+                    )
+                    if self.condition is not None:
+                        values, nulls = evaluate(self.condition, combined)
+                        match_mask = values & ~nulls
+                    else:
+                        match_mask = np.ones(combined.row_count, dtype=np.bool_)
+                    if not np.any(match_mask):
+                        continue
+                    left_matched[left_idx[match_mask]] = True
+                    right_matched[right_pos][right_idx[match_mask]] = True
+                    yield combined.take(np.nonzero(match_mask)[0])
             if needs_left_unmatched:
                 unmatched = np.nonzero(~left_matched)[0]
                 if unmatched.size > 0:

@@ -134,3 +134,34 @@ def test_join_output_schema_is_left_columns_then_right_columns() -> None:
     condition = _equi_condition()
     join = HashJoinOperator(_customers(source), _orders(source), JoinType.INNER, condition)
     assert join.output_schema.columns == ("c.id", "c.name", "o.id", "o.customer_id", "o.amount")
+
+
+@pytest.mark.parametrize("join_type", list(JoinType))
+def test_nested_loop_join_chunking_does_not_change_results(
+    join_type: JoinType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con un tope de pares minúsculo (1 fila de `left` por paso) el join
+    trocea cada batch en muchos pasos; el resultado debe ser idéntico al del
+    tope por defecto, incluidas las filas no emparejadas de joins externos."""
+    import vectorized_execution_engine.joins as joins_module
+
+    def run() -> set[tuple[object, object]]:
+        source = _source()
+        join = NestedLoopJoinOperator(
+            _customers(source), _orders(source), join_type, _equi_condition()
+        )
+        return _pairs(join)
+
+    expected = run()
+    monkeypatch.setattr(joins_module, "MAX_PAIRS_PER_STEP", 1)
+    assert run() == expected
+
+
+def test_nested_loop_join_bounds_the_combined_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vectorized_execution_engine.joins as joins_module
+
+    monkeypatch.setattr(joins_module, "MAX_PAIRS_PER_STEP", 4)
+    source = _source()
+    join = NestedLoopJoinOperator(_customers(source), _orders(source), JoinType.INNER, None)
+    sizes = [batch.row_count for batch in join.execute()]
+    assert sum(sizes) == 12 and max(sizes) <= 4
