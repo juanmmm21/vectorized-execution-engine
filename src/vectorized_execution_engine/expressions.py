@@ -167,12 +167,12 @@ def infer_expression_type(expr: Expression, schema: Schema) -> ColumnType:
     if isinstance(expr, BinaryOp):
         if expr.operator in _LOGICAL_OPERATORS or expr.operator in _COMPARISON_OPERATORS:
             return ColumnType.BOOLEAN
-        if expr.operator is BinaryOperator.DIV:
-            return ColumnType.FLOAT
         left_type = infer_expression_type(expr.left, schema)
         right_type = infer_expression_type(expr.right, schema)
         if ColumnType.FLOAT in (left_type, right_type):
             return ColumnType.FLOAT
+        # INTEGER / INTEGER es división entera (SQL estándar, PostgreSQL,
+        # SQLite): el resultado sigue siendo INTEGER.
         return ColumnType.INTEGER
     if isinstance(expr, UnaryOp):
         if expr.operator is UnaryOperator.NOT:
@@ -230,6 +230,32 @@ def _broadcast_literal(expr: Literal, row_count: int) -> EvaluatedColumn:
     return data, nulls
 
 
+def _is_integer_array(values: np.ndarray) -> bool:
+    return values.dtype.kind in ("i", "u")
+
+
+def _divide(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """`/` con la semántica SQL: entero entre entero es división entera
+    TRUNCADA hacia cero (`-7 / 2 = -3`, como PostgreSQL, SQLite y C — no el
+    `//` de Python, que redondea hacia menos infinito); si algún operando
+    es real, división real."""
+    if _is_integer_array(left) and _is_integer_array(right):
+        safe = np.where(right == 0, 1, right)
+        quotient = np.floor_divide(left, safe)
+        inexact = (np.remainder(left, safe) != 0) & ((left < 0) != (safe < 0))
+        return np.asarray(quotient + inexact.astype(quotient.dtype))
+    return np.asarray(left / right)
+
+
+def _modulo(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """`%` con el signo del dividendo (`-7 % 3 = -1`), coherente con la
+    división truncada: `a = (a / b) * b + a % b` siempre se cumple."""
+    if _is_integer_array(left) and _is_integer_array(right):
+        safe = np.where(right == 0, 1, right)
+        return np.asarray(np.fmod(left, safe))
+    return np.asarray(np.fmod(left, right))
+
+
 def _apply_binary(op_name: str, left: np.ndarray, right: np.ndarray) -> np.ndarray:
     """Aplica el ufunc de NumPy correspondiente, envolviendo cualquier
     `TypeError`/`ValueError` (p. ej. sumar un array de texto con uno
@@ -244,9 +270,9 @@ def _apply_binary(op_name: str, left: np.ndarray, right: np.ndarray) -> np.ndarr
             elif op_name == "MUL":
                 result = left * right
             elif op_name == "DIV":
-                result = left / right
+                result = _divide(left, right)
             elif op_name == "MOD":
-                result = left % right
+                result = _modulo(left, right)
             elif op_name == "EQ":
                 result = left == right
             elif op_name == "NEQ":

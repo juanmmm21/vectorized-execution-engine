@@ -287,7 +287,49 @@ def test_infer_expression_type_comparison_is_boolean() -> None:
     assert infer_expression_type(expr, schema) is ColumnType.BOOLEAN
 
 
-def test_infer_expression_type_division_is_float() -> None:
-    schema = Schema(("a",), {"a": ColumnType.INTEGER})
-    expr = BinaryOp(ColumnRef("a"), BinaryOperator.DIV, Literal(2, LiteralType.INTEGER))
-    assert infer_expression_type(expr, schema) is ColumnType.FLOAT
+def test_infer_expression_type_integer_division_stays_integer() -> None:
+    schema = Schema(("a", "f"), {"a": ColumnType.INTEGER, "f": ColumnType.FLOAT})
+    int_div = BinaryOp(ColumnRef("a"), BinaryOperator.DIV, Literal(2, LiteralType.INTEGER))
+    real_div = BinaryOp(ColumnRef("a"), BinaryOperator.DIV, ColumnRef("f"))
+    assert infer_expression_type(int_div, schema) is ColumnType.INTEGER
+    assert infer_expression_type(real_div, schema) is ColumnType.FLOAT
+
+
+def _truncated_reference(a: int, b: int) -> tuple[int, int]:
+    """División y resto truncados hacia cero (C, PostgreSQL, SQLite),
+    calculados con enteros de Python como referencia independiente."""
+    quotient = abs(a) // abs(b)
+    if (a < 0) != (b < 0):
+        quotient = -quotient
+    return quotient, a - b * quotient
+
+
+def test_integer_division_truncates_toward_zero_like_sql() -> None:
+    pairs = [(a, b) for a in range(-9, 10) for b in (-4, -3, -2, -1, 1, 2, 3, 4)]
+    pairs += [(2**62 + 3, 7), (-(2**62) - 5, 3), (-(2**63), 1)]
+    batch = _batch(
+        {
+            "a": ([a for a, _ in pairs], ColumnType.INTEGER),
+            "b": ([b for _, b in pairs], ColumnType.INTEGER),
+        }
+    )
+    div_values, div_nulls = evaluate(
+        BinaryOp(ColumnRef("a"), BinaryOperator.DIV, ColumnRef("b")), batch
+    )
+    mod_values, _ = evaluate(BinaryOp(ColumnRef("a"), BinaryOperator.MOD, ColumnRef("b")), batch)
+    assert div_values.dtype.kind == "i"
+    assert not div_nulls.any()
+    for (a, b), quotient, remainder in zip(pairs, div_values, mod_values, strict=True):
+        assert (int(quotient), int(remainder)) == _truncated_reference(a, b), (a, b)
+
+
+def test_division_with_a_real_operand_is_real() -> None:
+    batch = _batch({"a": ([7, -7], ColumnType.INTEGER), "f": ([2.0, 2.0], ColumnType.FLOAT)})
+    values, _ = evaluate(BinaryOp(ColumnRef("a"), BinaryOperator.DIV, ColumnRef("f")), batch)
+    assert values.tolist() == [3.5, -3.5]
+
+
+def test_integer_division_ignores_zero_divisors_in_null_rows() -> None:
+    batch = _batch({"a": ([7, None], ColumnType.INTEGER), "b": ([2, 0], ColumnType.INTEGER)})
+    values, nulls = evaluate(BinaryOp(ColumnRef("a"), BinaryOperator.DIV, ColumnRef("b")), batch)
+    assert int(values[0]) == 3 and nulls.tolist() == [False, True]
